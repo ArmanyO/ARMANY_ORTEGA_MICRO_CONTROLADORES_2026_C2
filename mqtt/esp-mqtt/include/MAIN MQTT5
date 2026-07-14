@@ -1,0 +1,238 @@
+/*
+ * SPDX-FileCopyrightText: 2022-2023 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include "esp_system.h"
+#include "nvs_flash.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "protocol_examples_common.h"
+#include "esp_log.h"
+#include "mqtt_client.h"
+#include "soc/gpio_reg.h"
+#include "soc/gpio_struct.h"
+#include "hal/gpio_hal.h"
+
+static const char *TAG = "mqtt5_example";
+
+// Definición del LED
+#define LED_GPIO 2  // GPIO2 = LED azul integrado
+
+// ============================================================
+// FUNCIONES PARA CONTROLAR LED SIN driver/gpio.h
+// ============================================================
+static inline void led_on(void) {
+    REG_SET_BIT(GPIO_OUT_W1TS_REG, BIT(LED_GPIO));
+}
+
+static inline void led_off(void) {
+    REG_SET_BIT(GPIO_OUT_W1TC_REG, BIT(LED_GPIO));
+}
+
+static inline void led_init(void) {
+    // Configurar GPIO2 como salida
+    REG_SET_BIT(GPIO_ENABLE_W1TS_REG, BIT(LED_GPIO));
+    led_off();  // Iniciar apagado
+}
+
+static void log_error_if_nonzero(const char *message, int error_code)
+{
+    if (error_code != 0) {
+        ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
+    }
+}
+
+static esp_mqtt5_user_property_item_t user_property_arr[] = {
+        {"board", "esp32"},
+        {"u", "user"},
+        {"p", "password"}
+    };
+
+#define USE_PROPERTY_ARR_SIZE   sizeof(user_property_arr)/sizeof(esp_mqtt5_user_property_item_t)
+
+static esp_mqtt5_publish_property_config_t publish_property = {
+    .payload_format_indicator = 1,
+    .message_expiry_interval = 1000,
+    .topic_alias = 0,
+    .response_topic = "/topic/test/response",
+    .correlation_data = "123456",
+    .correlation_data_len = 6,
+};
+
+static esp_mqtt5_subscribe_property_config_t subscribe_property = {
+    .subscribe_id = 25555,
+    .no_local_flag = false,
+    .retain_as_published_flag = false,
+    .retain_handle = 0,
+    .is_share_subscribe = true,
+    .share_name = "group1",
+};
+
+static esp_mqtt5_subscribe_property_config_t subscribe1_property = {
+    .subscribe_id = 25555,
+    .no_local_flag = true,
+    .retain_as_published_flag = false,
+    .retain_handle = 0,
+};
+
+static esp_mqtt5_unsubscribe_property_config_t unsubscribe_property = {
+    .is_share_subscribe = true,
+    .share_name = "group1",
+};
+
+static esp_mqtt5_disconnect_property_config_t disconnect_property = {
+    .session_expiry_interval = 60,
+    .disconnect_reason = 0,
+};
+
+static void print_user_property(mqtt5_user_property_handle_t user_property)
+{
+    if (user_property) {
+        uint8_t count = esp_mqtt5_client_get_user_property_count(user_property);
+        if (count) {
+            esp_mqtt5_user_property_item_t *item = malloc(count * sizeof(esp_mqtt5_user_property_item_t));
+            if (esp_mqtt5_client_get_user_property(user_property, item, &count) == ESP_OK) {
+                for (int i = 0; i < count; i ++) {
+                    esp_mqtt5_user_property_item_t *t = &item[i];
+                    ESP_LOGI(TAG, "key is %s, value is %s", t->key, t->value);
+                    free((char *)t->key);
+                    free((char *)t->value);
+                }
+            }
+            free(item);
+        }
+    }
+}
+
+// ============================================================
+// FUNCIÓN PARA CONTROLAR EL LED
+// ============================================================
+static void control_led(const char *data, int data_len)
+{
+    // Convertir el dato recibido a string
+    char message[32];
+    int len = data_len < sizeof(message) - 1 ? data_len : sizeof(message) - 1;
+    memcpy(message, data, len);
+    message[len] = '\0';
+    
+    ESP_LOGI(TAG, "Comando recibido: '%s'", message);
+    
+    // Comparar el mensaje recibido
+    if (strcmp(message, "ON") == 0 || strcmp(message, "1") == 0) {
+        led_on();
+        ESP_LOGI(TAG, "🔵 LED ENCENDIDO");
+    } 
+    else if (strcmp(message, "OFF") == 0 || strcmp(message, "0") == 0) {
+        led_off();
+        ESP_LOGI(TAG, "⚫ LED APAGADO");
+    }
+    else {
+        ESP_LOGI(TAG, "Comando desconocido: '%s'", message);
+        ESP_LOGI(TAG, "Usa 'ON' o '1' para encender, 'OFF' o '0' para apagar");
+    }
+}
+
+/*
+ * @brief Event handler registered to receive MQTT events
+ */
+static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32, base, event_id);
+    esp_mqtt_event_handle_t event = event_data;
+    esp_mqtt_client_handle_t client = event->client;
+    int msg_id;
+
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        print_user_property(event->property->user_property);
+        
+        // ============================================================
+        // PUBLICAR un mensaje inicial
+        // ============================================================
+        esp_mqtt5_client_set_user_property(&publish_property.user_property, user_property_arr, USE_PROPERTY_ARR_SIZE);
+        esp_mqtt5_client_set_publish_property(client, &publish_property);
+        msg_id = esp_mqtt_client_publish(client, "/topic/qos1", "ESP32 conectado!", 0, 1, 1);
+        esp_mqtt5_client_delete_user_property(publish_property.user_property);
+        publish_property.user_property = NULL;
+        ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+
+        // ============================================================
+        // SUSCRIBIRSE al topic qos0 para recibir comandos del LED
+        // ============================================================
+        esp_mqtt5_client_set_user_property(&subscribe_property.user_property, user_property_arr, USE_PROPERTY_ARR_SIZE);
+        esp_mqtt5_client_set_subscribe_property(client, &subscribe_property);
+        msg_id = esp_mqtt_client_subscribe(client, "/topic/qos0", 0);
+        esp_mqtt5_client_delete_user_property(subscribe_property.user_property);
+        subscribe_property.user_property = NULL;
+        ESP_LOGI(TAG, "📡 Suscrito a /topic/qos0 para control del LED, msg_id=%d", msg_id);
+
+        // ============================================================
+        // SUSCRIBIRSE al topic qos1
+        // ============================================================
+        esp_mqtt5_client_set_user_property(&subscribe1_property.user_property, user_property_arr, USE_PROPERTY_ARR_SIZE);
+        esp_mqtt5_client_set_subscribe_property(client, &subscribe1_property);
+        msg_id = esp_mqtt_client_subscribe(client, "/topic/qos1", 2);
+        esp_mqtt5_client_delete_user_property(subscribe1_property.user_property);
+        subscribe1_property.user_property = NULL;
+        ESP_LOGI(TAG, "📡 Suscrito a /topic/qos1, msg_id=%d", msg_id);
+        break;
+
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        print_user_property(event->property->user_property);
+        break;
+
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+        print_user_property(event->property->user_property);
+        break;
+
+    case MQTT_EVENT_UNSUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+        print_user_property(event->property->user_property);
+        break;
+
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+        print_user_property(event->property->user_property);
+        break;
+
+    // ============================================================
+    // RECIBIR DATOS DEL BOTÓN
+    // ============================================================
+    case MQTT_EVENT_DATA:
+        ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+        print_user_property(event->property->user_property);
+        ESP_LOGI(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
+        ESP_LOGI(TAG, "DATA=%.*s", event->data_len, event->data);
+        
+        // Control del LED: si el topic es /topic/qos0, procesar comando
+        if (event->topic_len == strlen("/topic/qos0") && 
+            strncmp(event->topic, "/topic/qos0", event->topic_len) == 0) {
+            control_led(event->data, event->data_len);
+        }
+        break;
+
+    case MQTT_EVENT_ERROR:
+        ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+        print_user_property(event->property->user_property);
+        ESP_LOGI(TAG, "MQTT5 return code is %d", event->error_handle->connect_return_code);
+        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+            log_error_if_nonzero("reported from esp-tls", event->error_handle->esp_tls_last_esp_err);
+            log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
+            log_error_if_nonzero("captured as transport's socket errno",  event->error_handle->esp_transport_sock_errno);
+            ESP_LOGI(TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
+        }
+        break;
+
+    default:
+        ESP_LOGI(TAG, "Other event id:%d", event->event_id);
+        break;
+    }
