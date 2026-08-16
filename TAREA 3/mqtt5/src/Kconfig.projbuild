@@ -1,0 +1,15 @@
+menu "MQTT5 LED Config"
+
+config EXAMPLE_WIFI_SSID
+    string "WiFi SSID"
+    default "Las Penas"
+
+config EXAMPLE_WIFI_PASSWORD
+    string "WiFi Password"
+    default "Pena123321"
+
+config BROKER_URL
+    string "MQTT Broker URL"
+    default "mqtt://broker.hivemq.com"
+
+endmenu
